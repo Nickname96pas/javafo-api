@@ -1,150 +1,103 @@
-import express from "express";
-import bodyParser from "body-parser";
-import cors from "cors";
-import morgan from "morgan";
-import { spawn } from "child_process";
-import fs from "fs";
-import os from "os";
-import path from "path";
-import { fileURLToPath } from "url";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// server.js (CommonJS) — API wrapper per JaVaFo con fallback sicuro
+require('dotenv').config();
+const express = require('express');
+const { spawn } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+app.use(express.json({ limit: '2mb' }));
 
-// --- Sicurezza semplice: token Bearer opzionale ---
-const API_TOKEN = process.env.API_TOKEN || null;
-app.use((req, res, next) => {
-  if (!API_TOKEN) return next(); // nessun token richiesto
-  const hdr = req.headers.authorization || "";
-  if (!hdr.startsWith("Bearer ")) {
-    return res.status(401).json({ error: "Missing Bearer token" });
+// --- Auth middleware (Bearer <API_TOKEN>) ---
+function auth(req, res, next) {
+  const hdr = req.headers['authorization'] || '';
+  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
+  const expected = process.env.API_TOKEN || '';
+  if (!expected) {
+    return res.status(500).json({ error: 'API_TOKEN not configured on server' });
   }
-  const token = hdr.slice("Bearer ".length).trim();
-  if (token !== API_TOKEN) {
-    return res.status(403).json({ error: "Invalid token" });
+  if (!token || token !== expected) {
+    return res.status(401).json({ error: 'Unauthorized' });
   }
   next();
+}
+
+// --- Health check pubblico (senza auth) ---
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, uptime: process.uptime() });
 });
 
-app.use(cors());
-app.use(bodyParser.json({ limit: "2mb" }));
-app.use(morgan("tiny"));
-
-// --- Utils per file temporanei ---
-function writeTemp(content, suffix) {
-  const p = path.join(os.tmpdir(), `javafo-${Date.now()}-${Math.random().toString(36).slice(2)}${suffix}`);
-  fs.writeFileSync(p, content, "utf8");
-  return p;
-  }
-
-// --- Mapper minimale: i tuoi dati -> TRF di prova (per round 1 funziona; per round >1 andrà completato) ---
-function toTRF(payload) {
-  const { players = [], tournament = {}, roundNumber = 1 } = payload || {};
-  const lines = [];
-  lines.push(`012 ${tournament?.name || "Tournament"}; R${roundNumber}`);
-  players.forEach((p, idx) => {
-    const cognome = (p.last_name || "").toUpperCase();
-    const nome = p.first_name || "";
-    const rating = p.elo || 0;
-    lines.push(`001 ${String(idx + 1).padStart(4,"0")} ${cognome}, ${nome} ${rating}`);
+// --- Ping JaVaFo (con auth) ---
+app.get('/javafo/ping', auth, async (_req, res) => {
+  const child = spawn('java', ['-jar', '/app/javafo.jar', '-h'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '', err = '';
+  child.stdout.on('data', d => (out += d.toString()));
+  child.stderr.on('data', d => (err += d.toString()));
+  child.on('close', code => {
+    res.json({ code, stdout: out, stderr: err });
   });
-  // TODO: per round > 1 aggiungi i risultati storici in TRF
-  return lines.join("\n") + "\n";
+});
+
+// --- Util: crea file temp in /tmp ---
+function tmpFile(ext) {
+  const name = `javafo_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${ext}`;
+  return path.join(os.tmpdir(), name);
 }
 
-// --- Parser output: per partire, restituiamo l'output grezzo (TRF), poi lo miglioreremo ---
-function normalizeOutput(text) {
-  return { raw: text };
+// --- Fallback pairing semplice per Round 1 (Dutch “top vs bottom”) ---
+function fallbackFirstRoundPairing(players) {
+  const arr = [...players].sort((a, b) => (b.elo || 0) - (a.elo || 0));
+  const n = arr.length;
+  const needsBye = n % 2 === 1;
+  let pool = arr;
+  let bye = null;
+  if (needsBye) {
+    bye = arr[n - 1];
+    pool = arr.slice(0, n - 1);
+  }
+  const half = Math.ceil(pool.length / 2);
+  const S1 = pool.slice(0, half);
+  const S2 = pool.slice(half);
+  const pairs = [];
+  for (let i = 0; i < S1.length; i++) {
+    const white = i % 2 === 0 ? S1[i] : S2[i];
+    const black = i % 2 === 0 ? S2[i] : S1[i];
+    pairs.push({ white_email: white.email, black_email: black.email });
+  }
+  if (bye) pairs.push({ white_email: bye.email, black_email: null });
+  return pairs;
 }
 
-// --- Health check: controlla Java & JaVaFo ---
-app.get("/api/pairings/health", (req, res) => {
+/**
+ * POST /api/pairings/fide-dutch
+ * Body atteso (come stai già usando):
+ * {
+ *   tournament: {...},
+ *   roundNumber: 1,
+ *   players: [{email, first_name, last_name, elo}, ...],
+ *   tournamentPlayers: [{email, score, color_history, opponents_faced, bye_count, withdrawn}, ...],
+ *   matches: [...]
+ * }
+ */
+app.post('/api/pairings/fide-dutch', auth, async (req, res) => {
   try {
-    const java = process.env.JAVA_BIN || "java";
-    const jar  = process.env.JAVAFO_JAR || "/app/javafo.jar";
-
-    const child = spawn(java, ["-version"]);
-    let ver = "";
-    child.stderr.on("data", d => (ver += d.toString("utf8")));
-    child.on("close", code => {
-      const help = spawn(java, ["-jar", jar, "--help"]);
-      let helpOut = "", helpErr = "";
-      help.stdout?.on("data", d => (helpOut += d.toString("utf8")));
-      help.stderr?.on("data", d => (helpErr += d.toString("utf8")));
-      help.on("close", hcode => {
-        if (hcode !== 0) {
-          return res.status(500).json({
-            ok: false,
-            java: (ver.split("\n")[0] || "").trim(),
-            jar,
-            error: "JaVaFo not runnable",
-            stderr: helpErr.trim()
-          });
-        }
-        return res.json({
-          ok: true,
-          java: (ver.split("\n")[0] || "").trim(),
-          jar,
-          help: (helpOut || helpErr || "").slice(0, 300)
-        });
-      });
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message || "health error" });
-  }
-});
-
-// --- Endpoint che invoca JaVaFo ---
-app.post("/api/pairings/fide-dutch", (req, res) => {
-  const payload = req.body || {};
-  const roundNumber = Number(payload.roundNumber || 1);
-
-  // 1) scrivi l'input TRF
-  const trf = toTRF(payload);
-  const inFile = writeTemp(trf, ".trf");
-  const outFile = writeTemp("", ".out");
-
-  const java = process.env.JAVA_BIN || "java";
-  const jar  = process.env.JAVAFO_JAR || "/app/javafo.jar";
-
-  // Nota: le opzioni possono variare a seconda della versione di JaVaFo.
-  // Se fallisce, vedremo l'errore in stderr.
-  const args = [
-    "-jar", jar,
-    "--in", inFile,
-    "--out", outFile,
-    "--system", "fide-dutch",
-    "--round", String(roundNumber)
-  ];
-
-  const child = spawn(java, args, { stdio: ["ignore", "pipe", "pipe"] });
-  let stdout = "", stderr = "";
-
-  const killTimer = setTimeout(() => { try { child.kill("SIGTERM"); } catch {} }, 15000);
-
-  child.stdout.on("data", d => (stdout += d.toString("utf8")));
-  child.stderr.on("data", d => (stderr += d.toString("utf8")));
-
-  child.on("close", code => {
-    clearTimeout(killTimer);
-    try {
-      const text = fs.existsSync(outFile) ? fs.readFileSync(outFile, "utf8") : stdout;
-      if (code !== 0) {
-        return res.status(500).json({ error: "JaVaFo failed", code, stderr: stderr.trim(), out: (text || "").slice(0, 4000) });
-      }
-      const json = normalizeOutput(text);
-      return res.json({ ...json, engine: { name: "javafo", code, stderr: stderr.trim() || undefined } });
-    } catch (e) {
-      return res.status(500).json({ error: e?.message || "read error", stderr: stderr.trim() || undefined });
-    } finally {
-      try { fs.unlinkSync(inFile); } catch {}
-      try { fs.unlinkSync(outFile); } catch {}
+    const { tournament, roundNumber, players, tournamentPlayers, matches } = req.body || {};
+    if (!Array.isArray(players) || !Array.isArray(tournamentPlayers) || !roundNumber) {
+      return res.status(400).json({ error: 'Bad Request: missing players/tournamentPlayers/roundNumber' });
     }
-  });
-});
 
-app.get("/", (_req, res) => res.send("javafo-api is running ✅"));
-app.listen(PORT, () => console.log(`javafo-api listening on :${PORT}`));
+    // TODO: COSTRUIRE FILE DI INPUT CORRETTO PER JaVaFo
+    // Senza specifiche ufficiali/flag esatti, molti jar escono con code=1.
+    // Qui creiamo un file "placeholder" TRF-like solo per mostrare il wiring.
+    const trfPath = tmpFile('trf');
+    const outPath = tmpFile('out.txt');
+
+    // Scriviamo un contenuto minimale (NON ancora FIDE-TRF completo!):
+    // -> scopo: avere un file reale sul disco da passare a JaVaFo.
+    const header = `001 ${tournament?.name || 'Tournament'}\n012 ${players.length}\n`;
+    const bodyLines = players.map((p, idx) => {
+      // Numero progressivo, Cognome Nome, Elo
+      const last = (p.last_name || '').replace(/\s+/g, ' ').trim() || `L${idx+1}`;
+      const first = (p.first_name || '').replace(/\s+/g_
